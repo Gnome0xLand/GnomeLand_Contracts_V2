@@ -7,15 +7,21 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
+interface IGnomeStickers {
+    function balanceOf(address owner) external view returns (uint256);
+    function hookMint() external;
+    function getCurrentMintPrice() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+}
+
 /**
- * @title GnomelandHook
- * @notice Uniswap V4 hook that collects fees from GNOME/ETH swaps and forwards them to NFT contract
- * @dev Implements afterSwap hook to collect a portion of swap volume as fees
+ * @title GnomelandHook - Auto-Minting Hook with NFT Holder Benefits
+ * @notice Collects fees and auto-mints NFTs
+ * @dev NFT holders trade with 0% fees! 🍄✨
  */
 contract GnomelandHook is 
     BaseHook, 
@@ -25,39 +31,30 @@ contract GnomelandHook is
 {
     using PoolIdLibrary for PoolKey;
 
-    // NFT contract that receives collected fees
     address public nftContract;
-    
-    // Fee percentage in basis points (100 = 1%)
-    uint256 public feePercentage;
-    
-    // Accumulated fees ready to be sent to NFT contract
+    uint256 public feePercentage; // Fee for non-holders
     uint256 public accumulatedFees;
     
-    // Minimum amount before triggering auto-transfer to NFT contract
-    uint256 public autoTransferThreshold;
+    // Stats
+    uint256 public totalFeesCollected;
+    uint256 public totalFeesSaved; // By NFT holders
+    uint256 public freeTradesCount; // Number of fee-free swaps
     
-    event FeesCollected(address indexed pool, uint256 amount);
+    event FeesCollected(address indexed pool, address indexed swapper, uint256 amount, bool isNFTHolder);
+    event AutoMinted(uint256 tokenId, uint256 cost);
     event FeesForwarded(address indexed nftContract, uint256 amount);
+    event FreeTradeUsed(address indexed holder, uint256 feesSaved);
     event NFTContractUpdated(address indexed oldContract, address indexed newContract);
     event FeePercentageUpdated(uint256 oldPercentage, uint256 newPercentage);
-    event AutoTransferThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {
         _disableInitializers();
     }
 
-    /**
-     * @notice Initialize the hook contract
-     * @param _nftContract Address of the NFT contract to receive fees
-     * @param _feePercentage Initial fee percentage (in basis points)
-     * @param _autoTransferThreshold Minimum ETH to trigger auto-transfer
-     */
     function initialize(
         address _nftContract,
-        uint256 _feePercentage,
-        uint256 _autoTransferThreshold
+        uint256 _feePercentage
     ) external initializer {
         require(_nftContract != address(0), "Invalid NFT contract");
         require(_feePercentage <= 1000, "Fee too high"); // Max 10%
@@ -68,12 +65,8 @@ contract GnomelandHook is
         
         nftContract = _nftContract;
         feePercentage = _feePercentage;
-        autoTransferThreshold = _autoTransferThreshold;
     }
 
-    /**
-     * @notice Returns the hook permissions
-     */
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
@@ -95,60 +88,137 @@ contract GnomelandHook is
 
     /**
      * @notice Hook called after each swap
-     * @dev Collects fees and forwards to NFT contract if threshold is met
+     * @dev NFT holders pay 0% fees! 🍄✨
      */
     function afterSwap(
-        address,
+        address sender,
         PoolKey calldata key,
         IPoolManager.SwapParams calldata params,
         BalanceDelta delta,
         bytes calldata
     ) external override onlyPoolManager returns (bytes4, int128) {
-        // Calculate fee based on swap volume
         uint256 swapAmount = params.amountSpecified > 0 
             ? uint256(params.amountSpecified) 
             : uint256(-params.amountSpecified);
         
-        uint256 feeAmount = (swapAmount * feePercentage) / 10000;
+        // Check if swapper owns any NFTs
+        bool isNFTHolder = _isNFTHolder(sender);
         
-        if (feeAmount > 0) {
-            accumulatedFees += feeAmount;
-            emit FeesCollected(address(uint160(uint256(PoolId.unwrap(key.toId())))), feeAmount);
+        uint256 feeAmount = 0;
+        
+        if (isNFTHolder) {
+            // 🎉 FREE TRADE for NFT holders!
+            feeAmount = 0;
             
-            // Auto-forward if threshold is met
-            if (accumulatedFees >= autoTransferThreshold) {
-                _forwardFees();
+            // Track savings
+            uint256 wouldHavePaid = (swapAmount * feePercentage) / 10000;
+            totalFeesSaved += wouldHavePaid;
+            freeTradesCount++;
+            
+            emit FreeTradeUsed(sender, wouldHavePaid);
+        } else {
+            // Regular fee for non-holders
+            feeAmount = (swapAmount * feePercentage) / 10000;
+            
+            if (feeAmount > 0) {
+                accumulatedFees += feeAmount;
+                totalFeesCollected += feeAmount;
             }
+        }
+        
+        emit FeesCollected(
+            address(uint160(uint256(PoolId.unwrap(key.toId())))), 
+            sender,
+            feeAmount,
+            isNFTHolder
+        );
+        
+        // Try to auto-mint if we have enough fees
+        if (accumulatedFees > 0) {
+            _tryAutoMint();
         }
         
         return (BaseHook.afterSwap.selector, 0);
     }
 
     /**
-     * @notice Manually trigger fee forwarding to NFT contract
+     * @notice Check if address owns at least one NFT
+     * @param holder Address to check
+     * @return true if holder owns >= 1 NFT
      */
-    function forwardFees() external nonReentrant {
-        _forwardFees();
+    function _isNFTHolder(address holder) internal view returns (bool) {
+        try IGnomeStickers(nftContract).balanceOf(holder) returns (uint256 balance) {
+            return balance > 0;
+        } catch {
+            return false; // If call fails, assume not a holder
+        }
     }
 
     /**
-     * @dev Internal function to forward accumulated fees to NFT contract
+     * @notice Check if an address is an NFT holder (public view)
      */
-    function _forwardFees() internal {
-        uint256 amount = accumulatedFees;
-        require(amount > 0, "No fees to forward");
+    function isNFTHolder(address holder) external view returns (bool) {
+        return _isNFTHolder(holder);
+    }
+
+    /**
+     * @notice Calculate what fee WOULD be charged (for display purposes)
+     */
+    function calculateFee(address swapper, uint256 swapAmount) external view returns (uint256) {
+        if (_isNFTHolder(swapper)) {
+            return 0; // NFT holders pay nothing! 🍄
+        }
+        return (swapAmount * feePercentage) / 10000;
+    }
+
+    /**
+     * @notice Try to mint a new NFT if we have enough fees
+     */
+    function _tryAutoMint() internal {
+        try IGnomeStickers(nftContract).getCurrentMintPrice() returns (uint256 mintPrice) {
+            // Check if we have enough + buffer for gas
+            if (accumulatedFees >= mintPrice + 0.01 ether) {
+                // Forward fees to NFT contract
+                uint256 toSend = accumulatedFees;
+                accumulatedFees = 0;
+                
+                (bool success, ) = nftContract.call{value: toSend}("");
+                require(success, "Fee transfer failed");
+                
+                emit FeesForwarded(nftContract, toSend);
+                
+                // Trigger mint
+                try IGnomeStickers(nftContract).hookMint() {
+                    uint256 supply = IGnomeStickers(nftContract).totalSupply();
+                    emit AutoMinted(supply - 1, mintPrice);
+                } catch {
+                    // Mint failed, fees are still in NFT contract for next time
+                }
+            }
+        } catch {
+            // Could not get mint price, skip for now
+        }
+    }
+
+    /**
+     * @notice Manually trigger mint (admin)
+     */
+    function manualMint() external onlyOwner nonReentrant {
+        require(accumulatedFees > 0, "No fees to forward");
         
+        uint256 toSend = accumulatedFees;
         accumulatedFees = 0;
         
-        (bool success, ) = nftContract.call{value: amount}("");
+        (bool success, ) = nftContract.call{value: toSend}("");
         require(success, "Fee transfer failed");
         
-        emit FeesForwarded(nftContract, amount);
+        emit FeesForwarded(nftContract, toSend);
+        
+        IGnomeStickers(nftContract).hookMint();
     }
 
     /**
-     * @notice Update the NFT contract address
-     * @param _nftContract New NFT contract address
+     * @notice Update NFT contract address
      */
     function setNFTContract(address _nftContract) external onlyOwner {
         require(_nftContract != address(0), "Invalid address");
@@ -158,8 +228,7 @@ contract GnomelandHook is
     }
 
     /**
-     * @notice Update the fee percentage
-     * @param _feePercentage New fee percentage in basis points
+     * @notice Update fee percentage for non-holders
      */
     function setFeePercentage(uint256 _feePercentage) external onlyOwner {
         require(_feePercentage <= 1000, "Fee too high"); // Max 10%
@@ -169,13 +238,22 @@ contract GnomelandHook is
     }
 
     /**
-     * @notice Update the auto-transfer threshold
-     * @param _threshold New threshold amount
+     * @notice Get comprehensive stats
      */
-    function setAutoTransferThreshold(uint256 _threshold) external onlyOwner {
-        uint256 oldThreshold = autoTransferThreshold;
-        autoTransferThreshold = _threshold;
-        emit AutoTransferThresholdUpdated(oldThreshold, _threshold);
+    function getStats() external view returns (
+        uint256 _accumulatedFees,
+        uint256 _totalFeesCollected,
+        uint256 _totalFeesSaved,
+        uint256 _freeTradesCount,
+        uint256 _feePercentage
+    ) {
+        return (
+            accumulatedFees,
+            totalFeesCollected,
+            totalFeesSaved,
+            freeTradesCount,
+            feePercentage
+        );
     }
 
     /**
@@ -184,7 +262,7 @@ contract GnomelandHook is
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     /**
-     * @notice Receive ETH from pool manager
+     * @notice Receive ETH
      */
     receive() external payable {}
 }

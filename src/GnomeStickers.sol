@@ -7,9 +7,9 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
- * @title GnomeStickers
- * @notice ERC721 NFT with dynamic pricing and integrated marketplace
- * @dev Implements bonding curve pricing where the 72nd NFT costs ~1 ETH
+ * @title GnomeStickers - Instant Liquidity NFT Marketplace
+ * @notice NFTs with automated minting and instant buy/sell liquidity
+ * @dev Contract acts as market maker - buys at floor, sells at 1.5x floor
  */
 contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
     using Strings for uint256;
@@ -27,31 +27,27 @@ contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
     address public treasury;
     uint256 public constant TREASURY_FEE_BPS = 600; // 6%
     
-    // Base URI for metadata
+    // Marketplace parameters
+    uint256 public constant SELL_PRICE_MULTIPLIER = 150; // 1.5x = 150%
+    uint256 public floorPrice;
+    
+    // Liquidity pool
+    uint256 public liquidityPool; // ETH available for buying back NFTs
+    
+    // Base URI
     string private _baseTokenURI;
     
-    // Marketplace
-    struct Listing {
-        uint256 price;
-        address seller;
-        bool isActive;
-    }
+    // Track which NFTs are owned by contract (available for sale)
+    mapping(uint256 => bool) public availableForPurchase;
+    uint256[] public availableTokens;
+    mapping(uint256 => uint256) private availableTokenIndex;
     
-    mapping(uint256 => Listing) public listings;
-    uint256 public floorPrice;
-    uint256[] private activeListings;
-    mapping(uint256 => uint256) private listingIndex;
-    
-    // Minting pool funded by Uniswap hook fees
-    uint256 public mintingPool;
-    
-    event Minted(address indexed to, uint256 indexed tokenId, uint256 price);
-    event Listed(uint256 indexed tokenId, uint256 price, address indexed seller);
-    event Delisted(uint256 indexed tokenId, address indexed seller);
-    event Purchased(uint256 indexed tokenId, address indexed buyer, address indexed seller, uint256 price);
+    event Minted(uint256 indexed tokenId, uint256 mintCost);
+    event BoughtFromContract(address indexed buyer, uint256 indexed tokenId, uint256 price);
+    event SoldToContract(address indexed seller, uint256 indexed tokenId, uint256 price);
+    event FloorPriceUpdated(uint256 newFloorPrice);
+    event LiquidityAdded(uint256 amount);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
-    event FeesReceived(uint256 amount);
-    event PricingMultiplierUpdated(uint256 newMultiplier);
 
     constructor(
         address _treasury,
@@ -64,11 +60,12 @@ contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
         // Calculate pricing multiplier so that token 72 costs 1 ETH
         pricingMultiplier = (TARGET_PRICE * 1000) / (TARGET_TOKEN_ID * TARGET_TOKEN_ID);
         
-        floorPrice = type(uint256).max;
+        // Initial floor price
+        floorPrice = getMintPrice(1);
     }
 
     /**
-     * @notice Calculate the price for minting a specific token ID
+     * @notice Calculate the base price for minting a specific token ID
      */
     function getMintPrice(uint256 tokenId) public view returns (uint256) {
         if (tokenId == 0) return 0.001 ether;
@@ -83,195 +80,167 @@ contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Get the current mint price for the next token
+     * @notice Get current mint price for next token
      */
-    function getCurrentMintPrice() external view returns (uint256) {
+    function getCurrentMintPrice() public view returns (uint256) {
         return getMintPrice(_nextTokenId);
     }
 
     /**
-     * @notice Mint a new NFT using funds from the minting pool
+     * @notice Get price to BUY from contract (1.5x floor)
      */
-    function mint() external nonReentrant {
+    function getBuyPrice() public view returns (uint256) {
+        return (floorPrice * SELL_PRICE_MULTIPLIER) / 100;
+    }
+
+    /**
+     * @notice Get price to SELL to contract (1x floor)
+     */
+    function getSellPrice() public view returns (uint256) {
+        return floorPrice;
+    }
+
+    /**
+     * @notice Hook contract mints new NFT when pool is sufficient
+     * @dev Only callable by hook contract (owner)
+     */
+    function hookMint() external onlyOwner nonReentrant {
         require(_nextTokenId < MAX_SUPPLY, "Max supply reached");
         
-        uint256 price = getMintPrice(_nextTokenId);
-        require(mintingPool >= price, "Insufficient minting pool funds");
-        
-        mintingPool -= price;
+        uint256 mintCost = getCurrentMintPrice();
+        require(address(this).balance >= mintCost, "Insufficient contract balance");
         
         uint256 tokenId = _nextTokenId++;
-        _safeMint(msg.sender, tokenId);
         
-        emit Minted(msg.sender, tokenId, price);
+        // Mint to this contract
+        _safeMint(address(this), tokenId);
+        
+        // Mark as available for purchase
+        availableForPurchase[tokenId] = true;
+        availableTokenIndex[tokenId] = availableTokens.length;
+        availableTokens.push(tokenId);
+        
+        // Update floor price based on mint cost
+        _updateFloorPrice(mintCost);
+        
+        emit Minted(tokenId, mintCost);
     }
 
     /**
-     * @notice Admin mint function
+     * @notice Buy NFT from contract at 1.5x floor price
+     * @param tokenId The token to purchase
      */
-    function adminMint(address to) external onlyOwner {
-        require(_nextTokenId < MAX_SUPPLY, "Max supply reached");
-        uint256 tokenId = _nextTokenId++;
-        _safeMint(to, tokenId);
-        emit Minted(to, tokenId, 0);
-    }
-
-    /**
-     * @notice List an NFT for sale at floor price
-     */
-    function listAtFloor(uint256 tokenId) external {
-        require(ownerOf(tokenId) == msg.sender, "Not token owner");
-        require(!listings[tokenId].isActive, "Already listed");
+    function buyFromContract(uint256 tokenId) external payable nonReentrant {
+        require(availableForPurchase[tokenId], "NFT not available");
+        require(ownerOf(tokenId) == address(this), "Contract doesn't own this NFT");
         
-        uint256 price = floorPrice == type(uint256).max ? getMintPrice(tokenId) : floorPrice;
+        uint256 price = getBuyPrice();
+        require(msg.value >= price, "Insufficient payment");
         
-        _createListing(tokenId, price);
-    }
-
-    /**
-     * @notice List an NFT for sale at a custom price
-     */
-    function listAtPrice(uint256 tokenId, uint256 price) external {
-        require(ownerOf(tokenId) == msg.sender, "Not token owner");
-        require(!listings[tokenId].isActive, "Already listed");
-        require(price > 0, "Price must be positive");
+        // Remove from available list
+        _removeFromAvailable(tokenId);
         
-        _createListing(tokenId, price);
-    }
-
-    /**
-     * @dev Internal function to create a listing
-     */
-    function _createListing(uint256 tokenId, uint256 price) internal {
-        listings[tokenId] = Listing({
-            price: price,
-            seller: msg.sender,
-            isActive: true
-        });
+        // Transfer NFT to buyer
+        _transfer(address(this), msg.sender, tokenId);
         
-        listingIndex[tokenId] = activeListings.length;
-        activeListings.push(tokenId);
+        // Add payment to liquidity pool
+        liquidityPool += price;
         
-        if (price < floorPrice) {
-            floorPrice = price;
+        // Send treasury fee
+        uint256 treasuryFee = (price * TREASURY_FEE_BPS) / 10000;
+        if (treasuryFee > 0) {
+            liquidityPool -= treasuryFee;
+            (bool success, ) = treasury.call{value: treasuryFee}("");
+            require(success, "Treasury transfer failed");
         }
         
-        emit Listed(tokenId, price, msg.sender);
-    }
-
-    /**
-     * @notice Delist an NFT from sale
-     */
-    function delist(uint256 tokenId) external {
-        Listing storage listing = listings[tokenId];
-        require(listing.isActive, "Not listed");
-        require(listing.seller == msg.sender, "Not seller");
-        
-        _removeListing(tokenId);
-        
-        emit Delisted(tokenId, msg.sender);
-    }
-
-    /**
-     * @notice Purchase a listed NFT
-     */
-    function purchase(uint256 tokenId) external payable nonReentrant {
-        Listing storage listing = listings[tokenId];
-        require(listing.isActive, "Not listed");
-        require(msg.value >= listing.price, "Insufficient payment");
-        
-        uint256 price = listing.price;
-        address seller = listing.seller;
-        
-        _removeListing(tokenId);
-        
-        uint256 treasuryFee = (price * TREASURY_FEE_BPS) / 10000;
-        uint256 sellerProceeds = price - treasuryFee;
-        
-        _transfer(seller, msg.sender, tokenId);
-        
-        (bool treasurySuccess, ) = treasury.call{value: treasuryFee}("");
-        require(treasurySuccess, "Treasury transfer failed");
-        
-        (bool sellerSuccess, ) = seller.call{value: sellerProceeds}("");
-        require(sellerSuccess, "Seller transfer failed");
-        
+        // Refund excess
         if (msg.value > price) {
             (bool refundSuccess, ) = msg.sender.call{value: msg.value - price}("");
             require(refundSuccess, "Refund failed");
         }
         
-        emit Purchased(tokenId, msg.sender, seller, price);
+        emit BoughtFromContract(msg.sender, tokenId, price);
     }
 
     /**
-     * @dev Remove a listing and update floor price
+     * @notice Sell NFT to contract at floor price (instant liquidity!)
+     * @param tokenId The token to sell
      */
-    function _removeListing(uint256 tokenId) internal {
-        uint256 listingPrice = listings[tokenId].price;
-        delete listings[tokenId];
+    function sellToContract(uint256 tokenId) external nonReentrant {
+        require(ownerOf(tokenId) == msg.sender, "Not token owner");
+        require(_nextTokenId > 0, "No floor price set");
         
-        uint256 index = listingIndex[tokenId];
-        uint256 lastIndex = activeListings.length - 1;
+        uint256 price = getSellPrice();
+        require(liquidityPool >= price, "Insufficient liquidity in contract");
+        
+        // Transfer NFT to contract
+        _transfer(msg.sender, address(this), tokenId);
+        
+        // Mark as available for purchase
+        availableForPurchase[tokenId] = true;
+        availableTokenIndex[tokenId] = availableTokens.length;
+        availableTokens.push(tokenId);
+        
+        // Pay seller
+        liquidityPool -= price;
+        (bool success, ) = msg.sender.call{value: price}("");
+        require(success, "Payment to seller failed");
+        
+        emit SoldToContract(msg.sender, tokenId, price);
+    }
+
+    /**
+     * @notice Get all NFTs available for purchase from contract
+     */
+    function getAvailableNFTs() external view returns (uint256[] memory) {
+        return availableTokens;
+    }
+
+    /**
+     * @notice Get count of available NFTs
+     */
+    function getAvailableCount() external view returns (uint256) {
+        return availableTokens.length;
+    }
+
+    /**
+     * @dev Remove token from available list
+     */
+    function _removeFromAvailable(uint256 tokenId) internal {
+        availableForPurchase[tokenId] = false;
+        
+        uint256 index = availableTokenIndex[tokenId];
+        uint256 lastIndex = availableTokens.length - 1;
         
         if (index != lastIndex) {
-            uint256 lastTokenId = activeListings[lastIndex];
-            activeListings[index] = lastTokenId;
-            listingIndex[lastTokenId] = index;
+            uint256 lastTokenId = availableTokens[lastIndex];
+            availableTokens[index] = lastTokenId;
+            availableTokenIndex[lastTokenId] = index;
         }
         
-        activeListings.pop();
-        delete listingIndex[tokenId];
-        
-        if (listingPrice == floorPrice) {
-            _updateFloorPrice();
-        }
+        availableTokens.pop();
+        delete availableTokenIndex[tokenId];
     }
 
     /**
-     * @dev Recalculate the floor price from active listings
+     * @dev Update floor price based on mint cost
      */
-    function _updateFloorPrice() internal {
-        if (activeListings.length == 0) {
-            floorPrice = type(uint256).max;
-            return;
-        }
-        
-        uint256 newFloor = type(uint256).max;
-        for (uint256 i = 0; i < activeListings.length; i++) {
-            uint256 tokenId = activeListings[i];
-            if (listings[tokenId].isActive && listings[tokenId].price < newFloor) {
-                newFloor = listings[tokenId].price;
-            }
-        }
-        floorPrice = newFloor;
+    function _updateFloorPrice(uint256 newFloorPrice) internal {
+        floorPrice = newFloorPrice;
+        emit FloorPriceUpdated(newFloorPrice);
     }
 
     /**
-     * @notice Get all active listings
+     * @notice Manual floor price adjustment (admin)
      */
-    function getActiveListings() external view returns (
-        uint256[] memory tokenIds,
-        uint256[] memory prices,
-        address[] memory sellers
-    ) {
-        uint256 count = activeListings.length;
-        tokenIds = new uint256[](count);
-        prices = new uint256[](count);
-        sellers = new address[](count);
-        
-        for (uint256 i = 0; i < count; i++) {
-            uint256 tokenId = activeListings[i];
-            tokenIds[i] = tokenId;
-            prices[i] = listings[tokenId].price;
-            sellers[i] = listings[tokenId].seller;
-        }
-        
-        return (tokenIds, prices, sellers);
+    function setFloorPrice(uint256 newFloorPrice) external onlyOwner {
+        require(newFloorPrice > 0, "Invalid floor price");
+        _updateFloorPrice(newFloorPrice);
     }
 
     /**
-     * @notice Update the treasury address
+     * @notice Update treasury address
      */
     function setTreasury(address _treasury) external onlyOwner {
         require(_treasury != address(0), "Invalid treasury");
@@ -281,16 +250,15 @@ contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Update the pricing multiplier
+     * @notice Update pricing multiplier
      */
     function setPricingMultiplier(uint256 _multiplier) external onlyOwner {
         require(_multiplier > 0, "Invalid multiplier");
         pricingMultiplier = _multiplier;
-        emit PricingMultiplierUpdated(_multiplier);
     }
 
     /**
-     * @notice Update base URI for token metadata
+     * @notice Update base URI
      */
     function setBaseURI(string memory baseURI) external onlyOwner {
         _baseTokenURI = baseURI;
@@ -304,7 +272,7 @@ contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Get token URI for a specific token
+     * @notice Get token URI
      */
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         _requireOwned(tokenId);
@@ -316,17 +284,38 @@ contract GnomeStickers is ERC721, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Receive ETH from Uniswap hook to fund minting pool
+     * @notice Receive ETH from hook to fund minting and liquidity
      */
     receive() external payable {
-        mintingPool += msg.value;
-        emit FeesReceived(msg.value);
+        liquidityPool += msg.value;
+        emit LiquidityAdded(msg.value);
     }
 
     /**
-     * @notice Get total number of minted tokens
+     * @notice Get total supply
      */
     function totalSupply() external view returns (uint256) {
         return _nextTokenId;
+    }
+
+    /**
+     * @notice Get contract stats
+     */
+    function getStats() external view returns (
+        uint256 totalMinted,
+        uint256 availableCount,
+        uint256 currentFloorPrice,
+        uint256 buyPrice,
+        uint256 sellPrice,
+        uint256 contractLiquidity
+    ) {
+        return (
+            _nextTokenId,
+            availableTokens.length,
+            floorPrice,
+            getBuyPrice(),
+            getSellPrice(),
+            liquidityPool
+        );
     }
 }
